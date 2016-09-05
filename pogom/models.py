@@ -5,20 +5,27 @@ import logging
 import random
 import math
 from peewee import Model, SqliteDatabase, InsertQuery, IntegerField, \
-    CharField, FloatField, BooleanField, DateTimeField, fn, SQL, CompositeKey
+    CharField, FloatField, BooleanField, DateTimeField, fn, SQL
 from datetime import datetime
 from base64 import b64encode
 import threading
 import calendar
 
-from .utils import get_pokemon_name
+from .utils import get_pokemon_name, get_args
+from playhouse.db_url import connect
 from .webhook import send_to_webhook, is_webhook_enabled
 
-db = SqliteDatabase('pogom.db', pragmas=(
-    ('journal_mode', 'WAL'),
-    ('cache_size', 10000),
-    ('mmap_size', 1024 * 1024 * 32),
-))
+args = get_args()
+
+if args.db != 'sqlite':
+    db = connect(args.db)
+else:
+    db = SqliteDatabase('pogom.db', pragmas=(
+        ('journal_mode', 'WAL'),
+        ('cache_size', 10000),
+        ('mmap_size', 1024 * 1024 * 32),
+    ))
+
 log = logging.getLogger(__name__)
 lock = threading.Lock()
 
@@ -35,15 +42,12 @@ class BaseModel(Model):
 class Pokemon(BaseModel):
     # We are base64 encoding the ids delivered by the api
     # because they are too big for sqlite to handle
-    encounter_id = CharField()
+    encounter_id = CharField(primary_key=True)
     spawnpoint_id = CharField()
     pokemon_id = IntegerField()
     latitude = FloatField()
     longitude = FloatField()
     disappear_time = DateTimeField()
-
-    class Meta:
-        primary_key = CompositeKey('encounter_id', 'disappear_time')
 
     @classmethod
     def get_active(cls):
@@ -134,10 +138,6 @@ def parse_map(map_dict):
         for p in cell.get('wild_pokemons', []):
             if p['encounter_id'] in pokemons:
                 continue  # prevent unnecessary parsing
-            
-            disappear_time = datetime.utcfromtimestamp(
-                (p['last_modified_timestamp_ms'] +
-                 p['time_till_hidden_ms']) / 1000.0)
 
             pokemons[p['encounter_id']] = {
                 'encounter_id': b64encode(str(p['encounter_id'])),
@@ -145,12 +145,15 @@ def parse_map(map_dict):
                 'pokemon_id': p['pokemon_data']['pokemon_id'],
                 'latitude': p['latitude'],
                 'longitude': p['longitude'],
-                'disappear_time': disappear_time
+                'disappear_time': datetime.utcfromtimestamp(
+                        (p['last_modified_timestamp_ms'] +
+                         p['time_till_hidden_ms']) / 1000.0)
             }
-            if p['time_till_hidden_ms'] < 0:
+            if p['time_till_hidden_ms'] < 0 or p['time_till_hidden_ms'] > 900000:
                 pokemons[p['encounter_id']]['disappear_time'] = datetime.utcfromtimestamp(
                         p['last_modified_timestamp_ms']/1000 + 15*60)
-            
+
+
             # WebHook
             if is_webhook_enabled():
                 webhook_data = dict(pokemons[p['encounter_id']])
@@ -158,7 +161,7 @@ def parse_map(map_dict):
                 webhook_data['last_modified_time'] = p['last_modified_timestamp_ms']
                 webhook_data['time_until_hidden_ms'] = p['time_till_hidden_ms']
                 send_to_webhook('pokemon', webhook_data)
-            
+
         for p in cell.get('catchable_pokemons', []):
             if p['encounter_id'] in pokemons:
                 continue  # prevent unnecessary parsing
